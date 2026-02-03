@@ -70,9 +70,12 @@ Follow these principles:
 
 **→ Update TodoWrite:** Mark "Running validation" as in_progress
 
-After implementing, run ALL quality checks:
+After implementing, run ALL quality checks, having restarted the local environment containers:
 
 ```bash
+# Start/Restart local containers
+kool start app cache database s3local
+
 # Code style - must pass
 kool run pint
 
@@ -80,9 +83,11 @@ kool run pint
 kool run phpstan
 
 # Unit/Feature tests - must pass
+kool run reset-test
 kool run test
 
 # Browser tests - must pass (for UI changes)
+kool run reset-test:browser
 kool run test:browser
 ```
 
@@ -219,5 +224,8 @@ If you encounter blockers:
 - Quality checks MUST pass before marking anything complete
 - One user story at a time - focus and complete
 - Update the PRD checkboxes to track progress accurately
+- **CRITICAL: After committing, you are DONE. Do not continue or wait for further input. Exit immediately.**
 
 Now, proceed to implement {{USER_STORY}} from {{PRD_FILE}}.
+
+**When finished:** After the commit is complete and all todos are marked done, stop immediately. Do not ask follow-up questions or wait for input.

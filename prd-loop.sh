@@ -20,6 +20,19 @@ NC='\033[0m' # No Color
 PROMPT_FILE="scripts/loop-prompt.md"
 MAX_ITERATIONS=50  # Safety limit
 ITERATION=0
+MODEL="${CLAUDE_MODEL:-claude-opus-4-5-20251101}"  # Default to Opus 4.5, override with env
+TIMEOUT_MINUTES="${CLAUDE_TIMEOUT:-30}"  # Per-story timeout in minutes
+
+# Detect timeout command (gtimeout on macOS via coreutils, timeout on Linux)
+if command -v gtimeout &> /dev/null; then
+    TIMEOUT_CMD="gtimeout"
+elif command -v timeout &> /dev/null; then
+    TIMEOUT_CMD="timeout"
+else
+    TIMEOUT_CMD=""
+    echo -e "${YELLOW}Warning: timeout command not found. Running without timeout safety.${NC}"
+    echo -e "${YELLOW}Install coreutils for timeout support: brew install coreutils${NC}"
+fi
 
 # Check arguments
 if [ -z "$1" ]; then
@@ -46,30 +59,33 @@ fi
 
 # Function to count incomplete user stories
 count_incomplete_stories() {
-    # Count US-XXX sections that have unchecked boxes
-    grep -E "^### US-[0-9]+" "$PRD_FILE" | while read -r line; do
+    local count=0
+    # Use process substitution to avoid subshell issues
+    while read -r line; do
         us_id=$(echo "$line" | grep -oE "US-[0-9]+")
         # Get the section content until next ### or ## (sed '$d' removes last line - works on macOS)
         section=$(sed -n "/^### $us_id/,/^##/p" "$PRD_FILE" | sed '$d')
         # Check if there are unchecked boxes
         if echo "$section" | grep -q "\- \[ \]"; then
-            echo "$us_id"
+            count=$((count + 1))
         fi
-    done | wc -l | tr -d ' '
+    done < <(grep -E "^### US-[0-9]+" "$PRD_FILE")
+    echo "$count"
 }
 
 # Function to get next incomplete user story ID
 get_next_incomplete_story() {
-    grep -E "^### US-[0-9]+" "$PRD_FILE" | while read -r line; do
+    # Use process substitution to avoid subshell issues with break/return
+    while read -r line; do
         us_id=$(echo "$line" | grep -oE "US-[0-9]+")
         # Get the section content until next ### or ## (sed '$d' removes last line - works on macOS)
         section=$(sed -n "/^### $us_id/,/^##/p" "$PRD_FILE" | sed '$d')
         # Check if there are unchecked boxes
         if echo "$section" | grep -q "\- \[ \]"; then
             echo "$us_id"
-            break
+            return 0
         fi
-    done
+    done < <(grep -E "^### US-[0-9]+" "$PRD_FILE")
 }
 
 # Function to display user story status summary
@@ -136,6 +152,7 @@ echo -e "${BLUE}PRD Implementation Loop${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo -e "PRD File: ${GREEN}$PRD_FILE${NC}"
 echo -e "Prompt File: ${GREEN}$PROMPT_FILE${NC}"
+echo -e "Model: ${GREEN}$MODEL${NC}"
 
 # Show initial status summary
 show_story_status
@@ -175,6 +192,14 @@ while true; do
 
     NEXT_STORY=$(get_next_incomplete_story)
 
+    # Safety check: if we have remaining stories but couldn't find the next one
+    if [ -z "$NEXT_STORY" ]; then
+        echo -e "${RED}Error: count_incomplete_stories reports $REMAINING remaining, but get_next_incomplete_story returned empty.${NC}"
+        echo -e "${RED}This indicates a bug in story detection. Please check the PRD file format.${NC}"
+        show_story_status
+        exit 1
+    fi
+
     echo -e "${BLUE}========================================${NC}"
     echo -e "${BLUE}Iteration $ITERATION / Remaining: $REMAINING${NC}"
     echo -e "${BLUE}========================================${NC}"
@@ -205,19 +230,54 @@ while true; do
     echo -e "${YELLOW}Calling Claude CLI...${NC}"
     echo ""
 
-    if claude --dangerously-skip-permissions -p "$PROMPT"; then
-        echo ""
-        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${GREEN}✅ Claude CLI completed iteration for $NEXT_STORY${NC}"
-        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    else
-        echo ""
-        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${RED}❌ Claude CLI exited with error. Stopping loop.${NC}"
-        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        show_story_status
-        exit 1
-    fi
+    RETRY_COUNT=0
+    MAX_RETRIES=3
+
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        # Wrap with timeout if available
+        # Redirect stdin from /dev/null to ensure CLI exits after completing (no waiting for input)
+        if [ -n "$TIMEOUT_CMD" ]; then
+            if $TIMEOUT_CMD "${TIMEOUT_MINUTES}m" claude --dangerously-skip-permissions --model "$MODEL" -p "$PROMPT" < /dev/null; then
+                CLI_SUCCESS=true
+            else
+                EXIT_CODE=$?
+                if [ $EXIT_CODE -eq 124 ]; then
+                    echo -e "${RED}Claude CLI timed out after ${TIMEOUT_MINUTES} minutes${NC}"
+                fi
+                CLI_SUCCESS=false
+            fi
+        else
+            if claude --dangerously-skip-permissions --model "$MODEL" -p "$PROMPT" < /dev/null; then
+                CLI_SUCCESS=true
+            else
+                CLI_SUCCESS=false
+            fi
+        fi
+
+        if [ "$CLI_SUCCESS" = true ]; then
+            echo ""
+            echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${GREEN}✅ Claude CLI completed iteration for $NEXT_STORY${NC}"
+            echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            break
+        else
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo ""
+                echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                echo -e "${YELLOW}⚠️ Claude CLI failed. Retry $RETRY_COUNT/$MAX_RETRIES in 5s...${NC}"
+                echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                sleep 5
+            else
+                echo ""
+                echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                echo -e "${RED}❌ Claude CLI failed after $MAX_RETRIES retries. Stopping loop.${NC}"
+                echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+                show_story_status
+                exit 1
+            fi
+        fi
+    done
 
     echo ""
     echo -e "${YELLOW}Checking progress...${NC}"
